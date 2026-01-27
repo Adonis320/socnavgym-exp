@@ -1,11 +1,13 @@
 import numpy as np
 from utils.StateEncoder import StateEncoder
 
+
 class StateDiscretizer(StateEncoder):
     """
     Handles discretization / binning of continuous state info:
-    - Robot (x, y) in world or robot frame (here: env.robot.x, env.robot.y)
-    - Humans (x, y) from obs["humans"]
+    - Robot (goal_dx, goal_dy) from obs["robot"]
+    - Closest human (x, y) from obs["humans"]
+    - Robot yaw angle theta from env.robot.orientation
     """
 
     def __init__(
@@ -17,7 +19,7 @@ class StateDiscretizer(StateEncoder):
         human_xy_max_abs=10.0,
         human_xy_edges=None,
         theta_bins=8,
-        env = None,
+        env=None,
     ):
         # Goal / robot position discretization
         self.xy_bins = int(xy_bins) if int(xy_bins) >= 2 else 2
@@ -43,10 +45,11 @@ class StateDiscretizer(StateEncoder):
         else:
             self.human_xy_edges = None
 
-        self.theta_bins = theta_bins              # or any number ≥2
-        self.theta_edges = np.linspace(
-            -np.pi, np.pi, num=self.theta_bins - 1, dtype=np.float32
-        )
+        # Theta discretization
+        self.theta_bins = int(theta_bins) if int(theta_bins) >= 2 else 2
+        # length B-1 for B bins
+        self.theta_edges = np.linspace(-np.pi, np.pi, num=self.theta_bins - 1, dtype=np.float32)
+
         self.env = env
 
     @staticmethod
@@ -54,7 +57,7 @@ class StateDiscretizer(StateEncoder):
         """
         Bin scalar x using ascending edges (open on right).
         edges: array of boundaries, length B-1 for B bins
-        Returns index in [0, B-1] if inside, or B if x >= last edge.
+        Returns index in [0, B-1].
         """
         for i, e in enumerate(edges):
             if x < e:
@@ -63,14 +66,12 @@ class StateDiscretizer(StateEncoder):
 
     def _discretize_robot_xy(self, obs) -> tuple[int, int]:
         """
-        Discretize robot position (x, y) using xy_*.
+        Discretize robot goal-relative position (goal_dx, goal_dy) using xy_*.
         Expects obs["robot"] with format [one_hot(D), goal_dx, goal_dy, robot_radius].
-        Always returns a pair of integers (bx, by). If robot info is missing,
-        returns a fixed sentinel (-1, -1).
+        Returns (bx, by). If missing, returns (-1, -1).
         """
         robot = obs.get("robot", None)
         if robot is None:
-            # Sentinel for "no robot info" but still a flat tuple of ints
             return -1, -1
 
         r = np.asarray(robot, dtype=np.float32).flatten()
@@ -79,32 +80,53 @@ class StateDiscretizer(StateEncoder):
         dx = float(r[D]) if r.size > D else 0.0
         dy = float(r[D + 1]) if r.size > D + 1 else 0.0
 
-        # Build edges if not provided
-        if self.xy_edges is not None:
-            edges = self.xy_edges
-        else:
-            edges = np.linspace(
+        edges = (
+            self.xy_edges
+            if self.xy_edges is not None
+            else np.linspace(
                 -self.xy_max_abs,
                 self.xy_max_abs,
                 num=max(self.xy_bins - 1, 1),
                 dtype=np.float32,
             )
+        )
 
         bx = self._bin_scalar(np.clip(dx, -self.xy_max_abs, self.xy_max_abs), edges)
         by = self._bin_scalar(np.clip(dy, -self.xy_max_abs, self.xy_max_abs), edges)
         return int(bx), int(by)
 
-    def _discretize_humans_xy(self, humans_array: np.ndarray) -> list[int]:
+    def _discretize_theta(self, theta: float) -> int:
         """
-        Discretize all humans (x, y) positions from a flat array.
-        Returns [hx_bin_0, hy_bin_0, hx_bin_1, hy_bin_1, ...]
+        Discretize robot yaw angle θ into [0, theta_bins-1].
+        θ is expected in radians.
         """
-        humans_bins = []
-        h = humans_array.flatten().astype(np.float32)
-        if h.size == 0:
-            return humans_bins
+        if theta is None:
+            return -1
 
-        # Default assumptions about human encoding
+        # Wrap angle to [-π, π]
+        theta = np.arctan2(np.sin(theta), np.cos(theta))
+
+        for i, e in enumerate(self.theta_edges):
+            if theta < e:
+                return int(i)
+        return int(len(self.theta_edges))
+
+    def _decode_closest_human_xy(self, humans_array: np.ndarray) -> tuple[float, float] | None:
+        """
+        Decode humans array and return (hx, hy) for the closest human to the robot (0,0),
+        based on min hx^2 + hy^2.
+
+        Supports the same assumptions as your original code:
+        - default one_hot_len=6, block=14
+        - inference attempt if size mismatch
+        - minimal fallback: assume single human with (x,y) at indices (6,7)
+
+        Returns None if cannot decode or no humans.
+        """
+        h = np.asarray(humans_array, dtype=np.float32).flatten()
+        if h.size == 0:
+            return None
+
         one_hot_len = 6
         block = 14
 
@@ -123,89 +145,63 @@ class StateDiscretizer(StateEncoder):
                     inferred = True
                     break
 
-            if not inferred and h.size >= 8:
+            if not inferred:
                 # Minimal fallback: assume single (x, y) at indices (6,7)
-                hx = float(h[6])
-                hy = float(h[7])
-                if self.human_xy_edges is not None:
-                    hedges = self.human_xy_edges
-                else:
-                    hedges = np.linspace(
-                        -self.human_xy_max_abs,
-                        self.human_xy_max_abs,
-                        num=max(self.human_xy_bins - 1, 1),
-                        dtype=np.float32,
-                    )
-                humans_bins.append(
-                    self._bin_scalar(
-                        np.clip(hx, -self.human_xy_max_abs, self.human_xy_max_abs),
-                        hedges,
-                    )
-                )
-                humans_bins.append(
-                    self._bin_scalar(
-                        np.clip(hy, -self.human_xy_max_abs, self.human_xy_max_abs),
-                        hedges,
-                    )
-                )
-                return [int(b) for b in humans_bins]
+                if h.size >= 8:
+                    return float(h[6]), float(h[7])
+                return None
 
         # Normal case: h.size is multiple of block
         if h.size % block != 0:
-            # cannot decode, return empty bins
-            return humans_bins
+            return None
 
-        if self.human_xy_edges is not None:
-            hedges = self.human_xy_edges
-        else:
-            hedges = np.linspace(
+        best_d2 = float("inf")
+        best_xy = None
+
+        for i in range(0, h.size, block):
+            base = i + one_hot_len  # x at base, y at base + 1
+            if base + 1 >= h.size:
+                continue
+            hx = float(h[base])
+            hy = float(h[base + 1])
+            d2 = hx * hx + hy * hy
+            if d2 < best_d2:
+                best_d2 = d2
+                best_xy = (hx, hy)
+
+        return best_xy
+
+    def _discretize_closest_human_xy(self, humans_array: np.ndarray) -> tuple[int, int]:
+        """
+        Return (hx_bin, hy_bin) for the closest human, or (-1, -1) if none.
+        """
+        xy = self._decode_closest_human_xy(humans_array)
+        if xy is None:
+            return -1, -1
+
+        hx, hy = xy
+
+        hedges = (
+            self.human_xy_edges
+            if self.human_xy_edges is not None
+            else np.linspace(
                 -self.human_xy_max_abs,
                 self.human_xy_max_abs,
                 num=max(self.human_xy_bins - 1, 1),
                 dtype=np.float32,
             )
+        )
 
-        for i in range(0, h.size, block):
-            base = i + one_hot_len  # x at base, y at base + 1
-            if base + 1 < h.size:
-                hx = float(h[base])
-                hy = float(h[base + 1])
-                bx = self._bin_scalar(
-                    np.clip(hx, -self.human_xy_max_abs, self.human_xy_max_abs),
-                    hedges,
-                )
-                by = self._bin_scalar(
-                    np.clip(hy, -self.human_xy_max_abs, self.human_xy_max_abs),
-                    hedges,
-                )
-                humans_bins.append(int(bx))
-                humans_bins.append(int(by))
-
-        return humans_bins
-    
-    def _discretize_theta(self, theta: float) -> int:
-        """
-        Discretize robot yaw angle θ into [0, theta_bins].
-        θ is expected in radians, range [-π, π] or any real.
-        """
-        if theta is None:
-            return -1
-
-        # Wrap angle to [-π, π]
-        theta = np.arctan2(np.sin(theta), np.cos(theta))
-
-        # Bin using theta_edges
-        for i, e in enumerate(self.theta_edges):
-            if theta < e:
-                return int(i)
-
-        return int(len(self.theta_edges))
+        hx_bin = self._bin_scalar(np.clip(hx, -self.human_xy_max_abs, self.human_xy_max_abs), hedges)
+        hy_bin = self._bin_scalar(np.clip(hy, -self.human_xy_max_abs, self.human_xy_max_abs), hedges)
+        return int(hx_bin), int(hy_bin)
 
     def encode(self, obs) -> tuple:
         """
         Public entry point:
         - obs: environment observation (dict with "humans" and "robot" keys)
-        Returns a flat, hashable state tuple of integers.
+        Returns a flat, hashable state tuple of integers:
+            (gx_bin, gy_bin, theta_bin, closest_hx_bin, closest_hy_bin)
         """
 
         # Normalize input: obs may be (obs, info) or other wrappers
@@ -217,30 +213,31 @@ class StateDiscretizer(StateEncoder):
             elif isinstance(obs[0], dict):
                 obs = obs[0]
 
-        # If still not dict, return a fixed fallback tuple (always a tuple)
         if not isinstance(obs, dict):
-            # Sentinel state: always a tuple of ints
-            return (-1, -1)
+            return (-1, -1, -1, -1, -1)
 
-        # 1) Robot bins (always a pair of ints)
+        # 1) Robot bins (goal_dx, goal_dy)
         gx, gy = self._discretize_robot_xy(obs)
 
-        # 2) Humans bins (list of ints, maybe empty)
-        humans_bins = []
+        # 2) Closest human bins only
+        hx_bin, hy_bin = -1, -1
         humans = obs.get("humans", None)
         if humans is not None:
-            humans_bins = self._discretize_humans_xy(
-                np.asarray(humans, dtype=np.float32)
-            )
+            hx_bin, hy_bin = self._discretize_closest_human_xy(np.asarray(humans, dtype=np.float32))
 
         # 3) Robot direction (theta)
         theta_raw = None
-        
-            # attempt nested extraction
-        theta_raw = self.env.env.env.env.robot.orientation
+        if self.env is not None:
+            # keep your original access pattern
+            try:
+                theta_raw = self.env.env.env.env.robot.orientation
+            except Exception:
+                # fallback attempts
+                try:
+                    theta_raw = self.env.robot.orientation
+                except Exception:
+                    theta_raw = None
 
         theta_bin = self._discretize_theta(theta_raw)
 
-        # final
-        state = (gx, gy, theta_bin, *humans_bins)
-        return state
+        return (gx, gy, theta_bin, hx_bin, hy_bin)

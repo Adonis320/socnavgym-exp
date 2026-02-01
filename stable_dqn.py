@@ -25,6 +25,38 @@ ap.add_argument("-d", "--use_deep_net", help="True or False, based on whether yo
 ap.add_argument("-g", "--gpu", help="gpu id to use", required=False, default="0")
 args = vars(ap.parse_args())
 
+from stable_baselines3.common.callbacks import BaseCallback
+
+class CometEpisodeCallback(BaseCallback):
+    def __init__(self, experiment):
+        super().__init__()
+        self.experiment = experiment
+        self.ep = 0
+
+    def _on_step(self) -> bool:
+        infos = self.locals.get("infos", None)
+        #print(infos)
+        if not infos:
+            return True
+
+        for info in infos:
+            ep_info = info.get("episode")
+            if ep_info is None:
+                continue
+
+            self.ep += 1
+            r = float(ep_info["r"])
+            l = int(ep_info["l"])
+            # strictly episode-based logging
+            self.experiment.log_metrics(
+                {
+                    "episode/return": r,
+                    "episode/length": l,
+                },
+                step=self.ep,  # episode index
+            )
+        return True
+
 
 if args["api_key"] is not None:
     from comet_ml import Experiment
@@ -37,7 +69,7 @@ if args["api_key"] is not None:
         """
         def __init__(self, run_name:str, save_path:str, project_name:str, api_key:str, verbose=0):
             # super(CometMLCallback, self).__init__(verbose)
-            super(CometMLCallback, self).__init__(save_freq=25000, save_path=save_path, verbose=verbose)
+            super(CometMLCallback, self).__init__(save_freq=100000, save_path=save_path, verbose=verbose)
             print("Logging using comet_ml")
             self.run_name = run_name
             self.experiment = Experiment(
@@ -76,6 +108,7 @@ if args["api_key"] is not None:
 env = gym.make("SocNavGym-v1", config=args["env_config"])
 env = DiscreteActions(env)
 env = ExpertObservations(env)
+env = Monitor(env, filename=f"{args['save_path']}/monitor.csv")
 
 net_arch = {}
 
@@ -88,11 +121,15 @@ else:
 policy_kwargs = {"net_arch" : net_arch}
 
 device = 'cuda:'+str(args["gpu"]) if torch.cuda.is_available() else 'cpu'
+# --- existing ---
 model = DQN("MultiInputPolicy", env, verbose=0, policy_kwargs=policy_kwargs, device=device)
+from stable_baselines3.common.callbacks import CallbackList
+
 if args["api_key"] is not None:
-    callback = CometMLCallback(args["run_name"], args["save_path"], args["project_name"], args["api_key"])
+    comet_cb = CometMLCallback(args["run_name"], args["save_path"], args["project_name"], args["api_key"])
+    comet_ep_cb = CometEpisodeCallback(comet_cb.experiment)  # <-- IMPORTANT
+    callback = CallbackList([comet_cb, comet_ep_cb])          # <-- run both
 else:
     callback = None
-    
-model.learn(total_timesteps=1000*600, callback=callback)
-model.save(args["save_path"])
+
+model.learn(total_timesteps=1000*300, callback=callback)

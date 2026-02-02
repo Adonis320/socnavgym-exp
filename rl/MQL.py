@@ -109,7 +109,6 @@ class MQL():
         episode_length = 0
 
         while True:
-            # Get Humanoid actions            # Epsilon-greedy action selection
             action = self.sample_action(state, eval)
             # Take action
             next_state, reward, done, truncated, info = env.step(action)

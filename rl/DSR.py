@@ -42,15 +42,16 @@ class Replay:
 # SR Head: ψ(s,a)
 # --------------------
 class SRHead(nn.Module):
-    def __init__(self, feat_dim: int, n_actions: int, hidden: int = 256):
+    def __init__(self, feat_dim: int, n_actions: int, hidden: int = 64):
         super().__init__()
         self.n_actions = int(n_actions)
         self.feat_dim = int(feat_dim)
-
         self.net = nn.Sequential(
-            nn.Linear(self.feat_dim, 64),
+            nn.Linear(self.feat_dim, 512),
             nn.ReLU(inplace=True),
-            nn.Linear(64, 128),
+            nn.Linear(512, 256),
+            nn.ReLU(inplace=True),
+            nn.Linear(256, 128),
             nn.ReLU(inplace=True),
             nn.Linear(128, hidden),
             nn.ReLU(inplace=True),

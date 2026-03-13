@@ -1,135 +1,82 @@
 import gymnasium as gym
 import socnavgym
 import torch
-import torch.nn as nn
-import torch.nn.functional as F
-from socnavgym.wrappers import DiscreteActions
-from socnavgym.wrappers import ExpertObservations
 from stable_baselines3 import DQN
-from stable_baselines3.common.torch_layers import BaseFeaturesExtractor
-from math import sqrt
+from stable_baselines3.common.callbacks import BaseCallback
 import argparse
-from stable_baselines3.common.callbacks import CheckpointCallback
-from stable_baselines3.common.results_plotter import ts2xy, plot_results
-from stable_baselines3.common.utils import safe_mean
-from stable_baselines3.common.callbacks import EvalCallback
-from stable_baselines3.common.monitor import Monitor
+import numpy as np
+from collections import deque
 
 ap = argparse.ArgumentParser()
 ap.add_argument("-e", "--env_config", help="path to environment config", required=True)
 ap.add_argument("-r", "--run_name", help="name of comet_ml run", required=True)
 ap.add_argument("-s", "--save_path", help="path to save the model", required=True)
-ap.add_argument("-p", "--project_name", help="project name in comet ml", required=False, default=None)
-ap.add_argument("-a", "--api_key", help="api key to your comet ml profile", required=False, default=None)
-ap.add_argument("-d", "--use_deep_net", help="True or False, based on whether you want a transformer based feature extractor", required=False, default=False)
-ap.add_argument("-g", "--gpu", help="gpu id to use", required=False, default="0")
+ap.add_argument("-p", "--project_name", required=False, default=None)
+ap.add_argument("-a", "--api_key", required=False, default=None)
+ap.add_argument("-d", "--use_deep_net", required=False, default=False)
+ap.add_argument("-g", "--gpu", required=False, default="0")
 args = vars(ap.parse_args())
 
-from stable_baselines3.common.callbacks import BaseCallback
+experiment = None
+if args["api_key"] is not None:
+    from comet_ml import Experiment
+    experiment = Experiment(api_key=args["api_key"], project_name=args["project_name"], parse_args=False)
+    experiment.set_name(args["run_name"])
+    print(f"[comet] logging to project '{args['project_name']}' as '{args['run_name']}'")
+else:
+    print("[info] no CometML api key – running without logging")
 
-class CometEpisodeCallback(BaseCallback):
-    def __init__(self, experiment):
+
+def log_metrics(metrics: dict, step: int):
+    if experiment is not None:
+        experiment.log_metrics(metrics, step=step)
+    else:
+        print(f"  step={step}  " + "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
+
+
+class CometCallback(BaseCallback):
+    def __init__(self):
         super().__init__()
-        self.experiment = experiment
-        self.ep = 0
+        self.ep_num = 0
+        self.ep_ret = 0.0
+        self.ep_len = 0
 
     def _on_step(self) -> bool:
-        infos = self.locals.get("infos", None)
-        #print(infos)
-        if not infos:
-            return True
+        rewards = self.locals.get("rewards", [])
+        dones   = self.locals.get("dones", [])
 
-        for info in infos:
-            ep_info = info.get("episode")
-            if ep_info is None:
-                continue
+        reward = rewards[0] if hasattr(rewards, '__len__') else float(rewards)
+        done   = dones[0]   if hasattr(dones,   '__len__') else bool(dones)
 
-            self.ep += 1
-            r = float(ep_info["r"])
-            l = int(ep_info["l"])
-            # strictly episode-based logging
-            self.experiment.log_metrics(
-                {
-                    "episode/return": r,
-                    "episode/length": l,
-                },
-                step=self.ep,  # episode index
+        self.ep_ret += float(reward)
+        self.ep_len += 1
+
+        if done:
+            self.ep_num += 1
+            log_metrics(
+                {"episode/return": self.ep_ret, "episode/length": self.ep_len},
+                step=self.ep_num,
             )
+            self.ep_ret = 0.0
+            self.ep_len = 0
+
         return True
 
 
-if args["api_key"] is not None:
-    from comet_ml import Experiment
-
-    class CometMLCallback(CheckpointCallback):
-        """
-        A custom callback that derives from ``BaseCallback``.
-
-        :param verbose: Verbosity level: 0 for no output, 1 for info messages, 2 for debug messages
-        """
-        def __init__(self, run_name:str, save_path:str, project_name:str, api_key:str, verbose=0):
-            # super(CometMLCallback, self).__init__(verbose)
-            super(CometMLCallback, self).__init__(save_freq=100000, save_path=save_path, verbose=verbose)
-            print("Logging using comet_ml")
-            self.run_name = run_name
-            self.experiment = Experiment(
-                api_key=api_key,
-                project_name=project_name,
-                parse_args=False   
-            )
-            self.experiment.set_name(self.run_name)
-
-        def _on_rollout_end(self) -> None:
-            """
-            This event is triggered before updating the policy.
-            """
-            metrics = {
-                "rollout/ep_rew_mean": safe_mean([ep_info["r"] for ep_info in self.locals['self'].ep_info_buffer]),
-                "rollout/ep_len_mean": safe_mean([ep_info["l"] for ep_info in self.locals['self'].ep_info_buffer])
-            }
-            if len(self.locals['self'].ep_success_buffer) > 0:
-                metrics["rollout/success_rate"] = safe_mean(self.locals['self'].ep_success_buffer)
-
-            l = [
-                "train/loss",
-                "train/n_updates",
-            ]
-
-            for val in l:
-                if val in self.logger.name_to_value.keys():
-                    metrics[val] = self.logger.name_to_value[val]
-
-            step = self.locals['self'].num_timesteps
-
-            self.experiment.log_metrics(metrics, step=step)
-            
-
+from socnavgym.wrappers import DiscreteActions, ExpertObservations
 
 env = gym.make("SocNavGym-v1", config=args["env_config"])
 env = DiscreteActions(env)
 env = ExpertObservations(env)
-env = Monitor(env, filename=f"{args['save_path']}/monitor.csv")
 
-net_arch = {}
+net_arch = [512, 256, 256, 256, 128, 128, 64] if args["use_deep_net"] else [512, 256, 128, 64]
+policy_kwargs = {"net_arch": net_arch}
 
-if not args["use_deep_net"]:
-    net_arch = [512, 256, 128, 64]
-
-else:
-    net_arch = [512, 256, 256, 256, 128, 128, 64]
-
-policy_kwargs = {"net_arch" : net_arch}
-
-device = 'cuda:'+str(args["gpu"]) if torch.cuda.is_available() else 'cpu'
-# --- existing ---
+device = f"cuda:{args['gpu']}" if torch.cuda.is_available() else "cpu"
 model = DQN("MultiInputPolicy", env, verbose=0, policy_kwargs=policy_kwargs, device=device)
-from stable_baselines3.common.callbacks import CallbackList
 
-if args["api_key"] is not None:
-    comet_cb = CometMLCallback(args["run_name"], args["save_path"], args["project_name"], args["api_key"])
-    comet_ep_cb = CometEpisodeCallback(comet_cb.experiment)  # <-- IMPORTANT
-    callback = CallbackList([comet_cb, comet_ep_cb])          # <-- run both
-else:
-    callback = None
+model.learn(total_timesteps=100_000, callback=CometCallback())
+model.save(args["save_path"])
 
-model.learn(total_timesteps=1000*300, callback=callback)
+if experiment is not None:
+    experiment.end()

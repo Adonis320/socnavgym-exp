@@ -1,13 +1,29 @@
-# agents/dsr_agent.py
-# DSR architecture matching the picture: Encoder -> phi, SR(psi) per action, linear reward phi^T w,
-# Decoder reconstructs s. Loss = SR Bellman + reward regression + reconstruction.
+# dsr_agent.py
+# Deep Successor Representations
+#
+# Architecture:
+#   state (5) → Encoder → φ (32)
+#   φ → reward head:  r̂ = φ^T w
+#   φ → SR head:      ψ(s,a) = u_α(φ)[a]   shape (B, A, F)
+#   Q(s,a) = ψ(s,a)^T w
+#
+# Why the encoder matters:
+#   r = φ^T w only holds if φ is a learned representation.
+#   With raw state coordinates, reward is non-linear (e.g. collision penalty)
+#   and w can never fit it. The encoder gives the network freedom to find
+#   a representation where reward IS approximately linear.
+#
+# Split optimizers:
+#   opt_enc_rw : encoder + w       (reward regression)
+#   opt_enc_sr : encoder + SR head (SR Bellman)
+#   Note: encoder is shared but updated by both losses independently.
 
 from __future__ import annotations
 
 import random
 from collections import deque
 from dataclasses import dataclass
-from typing import Any, Dict, Tuple
+from typing import Any, Dict, Optional, Tuple
 
 import numpy as np
 import torch
@@ -15,432 +31,323 @@ import torch.nn as nn
 import torch.nn.functional as F
 
 
-# --------------------
+# ──────────────────────────────────────────────
 # Replay Buffer
-# --------------------
+# ──────────────────────────────────────────────
 class Replay:
     def __init__(self, cap: int = 100_000):
-        self.buf = deque(maxlen=int(cap))
+        self.buf: deque = deque(maxlen=int(cap))
 
     def push(self, s: np.ndarray, a: int, r: float, s2: np.ndarray, done: bool):
-        self.buf.append(
-            (
-                np.asarray(s, dtype=np.float32),
-                int(a),
-                float(r),
-                np.asarray(s2, dtype=np.float32),
-                bool(done),
-            )
-        )
+        self.buf.append((
+            np.asarray(s,  dtype=np.float32),
+            int(a),
+            float(r),
+            np.asarray(s2, dtype=np.float32),
+            bool(done),
+        ))
 
-    def sample(self, n: int, device: str):
+    def sample(self, n: int, device: str) -> Dict[str, torch.Tensor]:
         s, a, r, s2, d = zip(*random.sample(self.buf, n))
-        S = torch.as_tensor(np.stack(s), dtype=torch.float32, device=device)
-        S2 = torch.as_tensor(np.stack(s2), dtype=torch.float32, device=device)
-        A = torch.as_tensor(a, dtype=torch.long, device=device)
-        R = torch.as_tensor(r, dtype=torch.float32, device=device)
-        D = torch.as_tensor(d, dtype=torch.float32, device=device)
-        return {"s": S, "a": A, "r": R, "s2": S2, "d": D}
+        return {
+            "s":  torch.as_tensor(np.stack(s),  dtype=torch.float32, device=device),
+            "s2": torch.as_tensor(np.stack(s2), dtype=torch.float32, device=device),
+            "a":  torch.as_tensor(a,             dtype=torch.long,    device=device),
+            "r":  torch.as_tensor(r,             dtype=torch.float32, device=device),
+            "d":  torch.as_tensor(d,             dtype=torch.float32, device=device),
+        }
 
-    def __len__(self):
+    def __len__(self) -> int:
         return len(self.buf)
 
 
-# --------------------
-# Encoder / Decoder (as in picture)
-# --------------------
-# --------------------
-# Encoder / Decoder (MLP, matching paper layer sizes without CNN)
-# --------------------
+# ──────────────────────────────────────────────
+# Encoder  f_θ
+# state_dim → feat_dim
+# Small but non-trivial: gives freedom for r = φ^T w to hold
+# ──────────────────────────────────────────────
 class Encoder(nn.Module):
-    """
-    Paper: 3 conv layers + FC(512).
-    No-CNN equivalent: 3 FC layers ending at feat_dim=512.
-    """
-    def __init__(self, state_dim: int, feat_dim: int = 512):
+    def __init__(self, state_dim: int, feat_dim: int):
         super().__init__()
         self.net = nn.Sequential(
-            nn.Linear(state_dim, 256),
+            nn.Linear(state_dim, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(256, 256),
+            nn.Linear(128, 128),
             nn.ReLU(inplace=True),
-            nn.Linear(256, feat_dim),  # FC 512 (paper)
+            nn.Linear(128, 128),
+            nn.ReLU(inplace=True),
+            nn.Linear(128, feat_dim),
         )
-        self._init()
-
-    def _init(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
                 nn.init.zeros_(m.bias)
 
     def forward(self, s: torch.Tensor) -> torch.Tensor:
-        return self.net(s)  # (B, feat_dim)
+        return self.net(s)   # (B, feat_dim)
 
 
-class Decoder(nn.Module):
-    """
-    Paper decoder deconv feature sizes: {512, 256, 128, 64, 4}.
-    No-CNN equivalent: MLP 512->256->128->64->state_dim.
-    (Replace "4" by state_dim for vector state reconstruction.)
-    """
-    def __init__(self, feat_dim: int = 512, state_dim: int = 5):
-        super().__init__()
-        self.net = nn.Sequential(
-            nn.Linear(feat_dim, 256),
-            nn.ReLU(inplace=True),
-            nn.Linear(256, 128),
-            nn.ReLU(inplace=True),
-            nn.Linear(128, 64),
-            nn.ReLU(inplace=True),
-            nn.Linear(64, state_dim),
-        )
-        self._init()
-
-    def _init(self):
-        for m in self.modules():
-            if isinstance(m, nn.Linear):
-                nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
-                nn.init.zeros_(m.bias)
-
-    def forward(self, phi: torch.Tensor) -> torch.Tensor:
-        return self.net(phi)  # (B, state_dim)
-
-
-# --------------------
-# SR Head: θψ with two fully-connected layers (as in caption)
-# --------------------
+# ──────────────────────────────────────────────
+# SR Head  u_α
+# feat_dim → sr_hidden → n_actions * feat_dim
+# ──────────────────────────────────────────────
 class SRHead(nn.Module):
-    """
-    Paper: θψ contains two fully-connected layers.
-    Implement: FC -> ReLU -> FC -> ReLU -> output (N*F)
-    """
-    def __init__(self, feat_dim: int, n_actions: int, hidden: int = 256):
+    def __init__(self, feat_dim: int, n_actions: int, hidden: int = 128):
         super().__init__()
         self.n_actions = int(n_actions)
-        self.feat_dim = int(feat_dim)
+        self.feat_dim  = int(feat_dim)
         self.net = nn.Sequential(
-            nn.Linear(self.feat_dim, hidden),  # FC1
+            nn.Linear(self.feat_dim, hidden),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden, hidden),         # FC2
+            nn.Linear(hidden, hidden),
             nn.ReLU(inplace=True),
-            nn.Linear(hidden, self.n_actions * self.feat_dim),  # output
+            nn.Linear(hidden, self.n_actions * self.feat_dim),
         )
-        self._init()
-
-    def _init(self):
         for m in self.modules():
             if isinstance(m, nn.Linear):
                 nn.init.kaiming_normal_(m.weight, nonlinearity="relu")
                 nn.init.zeros_(m.bias)
 
     def forward(self, phi: torch.Tensor) -> torch.Tensor:
-        out = self.net(phi)  # (B, A*F)
-        return out.view(-1, self.n_actions, self.feat_dim)  # (B, A, F)
+        return self.net(phi).view(-1, self.n_actions, self.feat_dim)  # (B, A, F)
 
 
-# --------------------
-# Full DSR module (matches picture)
-# --------------------
+# ──────────────────────────────────────────────
+# DSR
+# ──────────────────────────────────────────────
 class DSR(nn.Module):
-    """
-    - phi(s) = Encoder(s)
-    - psi(phi, a) = SRHead(phi)[a]
-    - r_hat(s) = phi(s)^T w   (linear reward, as in paper figure)
-    - s_hat = Decoder(phi)
-    - Q(s,a) = psi(s,a)^T w   (common in DSR)
-    """
-    def __init__(self, state_dim: int, feat_dim: int, n_actions: int, sr_hidden: int = 256):
+    def __init__(self, state_dim: int, feat_dim: int, n_actions: int, sr_hidden: int = 128):
         super().__init__()
-        self.enc = Encoder(state_dim, feat_dim)
-        self.dec = Decoder(feat_dim, state_dim)
-        self.sr = SRHead(feat_dim, n_actions, hidden=sr_hidden)
-        self.w = nn.Parameter(torch.zeros(feat_dim))
-        nn.init.normal_(self.w, mean=0.0, std=0.1)
-
+        self.encoder = Encoder(state_dim, feat_dim)
+        self.sr      = SRHead(feat_dim, n_actions, hidden=sr_hidden)
+        self.w       = nn.Parameter(torch.empty(feat_dim))
+        nn.init.normal_(self.w, mean=0.0, std=1.0 / feat_dim ** 0.5)
 
     def phi(self, s: torch.Tensor) -> torch.Tensor:
-        return self.enc(s)
-
-    def s_hat(self, phi: torch.Tensor) -> torch.Tensor:
-        return self.dec(phi)
+        return self.encoder(s)
 
     def r_hat(self, phi: torch.Tensor) -> torch.Tensor:
-        return phi.matmul(self.w)  # (B,)
+        return phi.matmul(self.w)
 
-    def q_all(self, phi: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor]:
-        psi = self.sr(phi)          # (B,A,F)
-        q = psi.matmul(self.w)      # (B,A)
-        return q, psi
-
-
-# --------------------
-# Loss step (matches picture + SR Bellman)
-# --------------------
-def dsr_loss_step(
-    net: DSR,
-    tgt: DSR,
-    batch: Dict[str, torch.Tensor],
-    gamma: float = 0.99,
-    lambda_r: float = 1.0,
-    lambda_d: float = 1.0,
-    lambda_sr: float = 1.0,
-):
-    """
-    Picture loss:
-      (r - phi^T w)^2 + ||s - d(phi)||^2
-    plus SR Bellman loss:
-      || psi(s,a) - (phi(s) + gamma * psi(s',a*)) ||^2
-
-    batch:
-      s,s2: (B,state_dim)   a: (B,)   r: (B,)   d: (B,)  (d is float 0/1)
-    """
-    s = batch["s"]
-    s2 = batch["s2"]
-    a = batch["a"].long()
-    r = batch["r"]
-    d = batch["d"]
-
-    # Encode
-    phi = net.phi(s)         # (B,F)
-    phi2 = net.phi(s2)       # (B,F)
-
-    # ---------- reward regression (phi^T w) ----------
-    r_hat = net.r_hat(phi)   # (B,)
-    loss_r = F.mse_loss(r_hat, r)
-
-    # ---------- reconstruction (decoder) ----------
-    s_hat = net.s_hat(phi)   # (B,state_dim)
-    loss_d = F.mse_loss(s_hat, s)
-
-    # ---------- SR Bellman ----------
-    q, psi = net.q_all(phi)  # psi: (B,A,F)
-
-    psi_sa = psi.gather(1, a.view(-1, 1, 1).expand(-1, 1, psi.size(-1))).squeeze(1)  # (B,F)
-
-    with torch.no_grad():
-        # a* from online Q (double-style); psi from target
-        q2_online, _ = net.q_all(phi2)
-        a_star = q2_online.argmax(1, keepdim=True)  # (B,1)
-
-        psi2_all = tgt.sr(phi2)  # (B,A,F)
-        psi2 = psi2_all.gather(1, a_star.view(-1, 1, 1).expand(-1, 1, psi2_all.size(-1))).squeeze(1)  # (B,F)
-
-        target_psi = phi + (1.0 - d).unsqueeze(-1) * gamma * psi2  # (B,F)
-
-    loss_sr = F.mse_loss(psi_sa, target_psi)
-
-    return lambda_sr * loss_sr + lambda_r * loss_r + lambda_d * loss_d
+    def q_all(self, s: torch.Tensor) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+        phi = self.encoder(s)
+        psi = self.sr(phi)              # (B, A, F)
+        q   = psi.matmul(self.w)       # (B, A)
+        return q, psi, phi
 
 
-def soft_update(net: nn.Module, tgt: nn.Module, tau: float = 0.005):
-    with torch.no_grad():
-        for p, pt in zip(net.parameters(), tgt.parameters()):
-            pt.data.mul_(1.0 - tau).add_(tau * p.data)
-
-
-# --------------------
-# DSRAgent (repo-friendly interface)
-# --------------------
+# ──────────────────────────────────────────────
+# Config
+# ──────────────────────────────────────────────
 @dataclass
 class DSRConfig:
-    action_size: int = 7
-    state_dim: int = 5
+    state_dim:   int   = 5    # raw input size (fixed by env)
+    feat_dim:    int   = 32   # encoder output size — φ lives here
+    action_size: int   = 7
+    enc_hidden:  int   = 128
 
-    feat_dim: int = 512      # paper FC size
-    sr_hidden: int = 256     # SR head hidden (2 FC layers)
-    # (Encoder/Decoder sizes are fixed to match paper values above)
+    map_size:    float = 10.0
+    sr_hidden:   int   = 128  # increased from 64
 
-    buffer_size: int = 50_000
-    batch_size: int = 128
-    start_steps: int = 5_000
-    train_freq: int = 1
+    buffer_size:  int   = 100_000
+    batch_size:   int   = 32
+    start_steps:  int   = 5_000    # start learning early (was 50k — caused epsilon/warmup mismatch)
+    train_freq:   int   = 4
 
-    gamma: float = 0.99
-    learning_rate: float = 3e-4  # recommended; 6e-3 is usually unstable here
-    epsilon: float = 0.3
+    gamma:         float = 0.95   # was 0.99: max |psi| ~ phi/(1-gamma) = 100x -> 20x
+    learning_rate: float = 1e-4
 
-    tau: float = 0.005
-    reward_clip: float | None = None
-    grad_clip: float = 5.0
+    # linear epsilon decay
+    epsilon_start:       float = 1.0
+    epsilon_end:         float = 0.05
+    epsilon_decay_steps: int   = 200_000
 
-    lambda_r: float = 1.0
-    lambda_d: float = 0.1
-    lambda_sr: float = 1.0
+    # hard target update
+    target_update_freq:  int   = 5_000   # was 10_000: fresher targets = less drift
 
-    device: str | None = None
+    reward_clip: Optional[float] = None
+    grad_clip:   float           = 0.5   # was 1.0: tighter clipping on SR gradients
+
+    lambda_r:  float = 1.0
+    lambda_sr: float = 0.5              # was 1.0: slower SR growth, less amplification
+
+    device: Optional[str] = None
 
 
-
+# ──────────────────────────────────────────────
+# DSRAgent
+# ──────────────────────────────────────────────
 class DSRAgent:
-    """
-    DSR matching the paper figure: learns phi(s), reconstructs s, learns linear reward, learns psi.
-
-    IMPORTANT: you must define get_state_vec(obs) -> np.ndarray of shape (state_dim,)
-    that is consistent across episodes and resets.
-    """
-
     def __init__(self, config: DSRConfig):
-        self.cfg = config
+        self.cfg    = config
         self.device = config.device or ("cuda" if torch.cuda.is_available() else "cpu")
 
         self.n_actions = int(config.action_size)
+        self.feat_dim  = int(config.feat_dim)
         self.state_dim = int(config.state_dim)
-        self.feat_dim = int(config.feat_dim)
+        self.map_size  = float(config.map_size)
 
-        self.net = DSR(self.state_dim, self.feat_dim, self.n_actions, sr_hidden=self.cfg.sr_hidden).to(self.device)
-        self.tgt = DSR(self.state_dim, self.feat_dim, self.n_actions, sr_hidden=self.cfg.sr_hidden).to(self.device)
-
-
+        self.net = DSR(self.state_dim, self.feat_dim, self.n_actions, self.cfg.sr_hidden).to(self.device)
+        self.tgt = DSR(self.state_dim, self.feat_dim, self.n_actions, self.cfg.sr_hidden).to(self.device)
         self.tgt.load_state_dict(self.net.state_dict())
+        for p in self.tgt.parameters():
+            p.requires_grad_(False)
 
-        self.opt_sr = torch.optim.Adam(self.net.sr.parameters(), lr=config.learning_rate)
-
-        self.opt_repr = torch.optim.Adam(
-            list(self.net.enc.parameters()) +
-            list(self.net.dec.parameters()) +
-            [self.net.w],
+        # Split optimizers:
+        #   opt_rw: encoder + w       → reward regression shapes φ to be reward-predictive
+        #   opt_sr: encoder + SR head → SR Bellman shapes φ to be successor-predictive
+        # Encoder is shared — both losses contribute to shaping φ
+        self.opt_rw = torch.optim.Adam(
+            list(self.net.encoder.parameters()) + [self.net.w],
             lr=config.learning_rate,
         )
+        self.opt_sr = torch.optim.Adam(
+            list(self.net.encoder.parameters()) + list(self.net.sr.parameters()),
+            lr=config.learning_rate,
+        )
+
         self.rb = Replay(config.buffer_size)
         self.total_steps = 0
 
-        # --------- observation to state vector settings ----------
-        self.max_humans = 1  # choose K for fixed-size encoding
+    # ── linear epsilon schedule ───────────────────────────────────────────────
+    @property
+    def epsilon(self) -> float:
+        t     = min(self.total_steps, self.cfg.epsilon_decay_steps)
+        ratio = t / max(self.cfg.epsilon_decay_steps, 1)
+        return self.cfg.epsilon_start + ratio * (self.cfg.epsilon_end - self.cfg.epsilon_start)
 
-    def _extract_goal_theta_from_robot(self, robot_arr: np.ndarray) -> tuple[float, float, float]:
-        r = np.asarray(robot_arr, dtype=np.float32).flatten()
-        if r.size >= 3:
-            return float(r[0]), float(r[1]), float(r[2])
-        return 0.0, 0.0, 0.0
-
-    def _extract_humans_xy(self, humans) -> np.ndarray:
-        if humans is None:
-            return np.zeros((0, 2), dtype=np.float32)
-        h = np.asarray(humans, dtype=np.float32)
-        if h.ndim == 2 and h.shape[1] >= 2:
-            return h[:, :2].astype(np.float32, copy=False)
-        h = h.flatten()
-        if h.size == 2:
-            return np.asarray([[h[0], h[1]]], dtype=np.float32)
-        if h.size >= 2:
-            return np.asarray([[float(h[0]), float(h[1])]], dtype=np.float32)
-        return np.zeros((0, 2), dtype=np.float32)
-
+    # ── obs → normalized state vector ────────────────────────────────────────
     def get_state_vec(self, obs: Any) -> np.ndarray:
         """
-        Fixed-size raw state s (input to encoder). Keep it simple and stable.
-        Example here:
-          s = [goal_x, goal_y, theta, h1x, h1y, ..., hKx, hKy]
-        So state_dim must be 3 + 2*K.
+        Parses ExpertObservations dict:
+          obs["robot"]  = [goal_x, goal_y, theta]
+          obs["humans"] = [hx, hy]
+        Normalizes to [-1, 1] and returns shape (5,).
         """
-        if isinstance(obs, (tuple, list)) and len(obs) == 2 and isinstance(obs[0], dict):
+        if isinstance(obs, (tuple, list)) and len(obs) >= 1 and isinstance(obs[0], dict):
             obs = obs[0]
+
         if not isinstance(obs, dict):
             return np.zeros((self.state_dim,), dtype=np.float32)
 
-        gx, gy, th = self._extract_goal_theta_from_robot(obs.get("robot", None))
+        robot = obs.get("robot", None)
+        if robot is not None:
+            r  = np.asarray(robot, dtype=np.float32).flatten()
+            gx = float(r[0]) if r.size > 0 else 0.0
+            gy = float(r[1]) if r.size > 1 else 0.0
+            th = float(r[2]) if r.size > 2 else 0.0
+        else:
+            gx, gy, th = 0.0, 0.0, 0.0
 
-        humans_xy = self._extract_humans_xy(obs.get("humans", None))
-        K = self.max_humans
-        if humans_xy.shape[0] > K:
-            humans_xy = humans_xy[:K]
-        pad = np.zeros((K, 2), dtype=np.float32)
-        if humans_xy.shape[0] > 0:
-            pad[: humans_xy.shape[0], :] = humans_xy
+        humans = obs.get("humans", None)
+        if humans is not None:
+            h  = np.asarray(humans, dtype=np.float32).flatten()
+            hx = float(h[0]) if h.size > 0 else 0.0
+            hy = float(h[1]) if h.size > 1 else 0.0
+        else:
+            hx, hy = 0.0, 0.0
 
-        s = np.concatenate([np.asarray([gx, gy, th], dtype=np.float32), pad.reshape(-1)], axis=0)
+        return np.array([
+            gx / self.map_size,
+            gy / self.map_size,
+            th / np.pi,
+            hx / self.map_size,
+            hy / self.map_size,
+        ], dtype=np.float32)
 
-        # safety: enforce shape = (state_dim,)
-        if s.size != self.state_dim:
-            out = np.zeros((self.state_dim,), dtype=np.float32)
-            m = min(out.size, s.size)
-            out[:m] = s[:m]
-            s = out
-
-        return s.astype(np.float32, copy=False)
-
+    # ── action selection ──────────────────────────────────────────────────────
     @torch.no_grad()
     def sample_action(self, s_np: np.ndarray, eval_mode: bool = False) -> int:
-        if (not eval_mode) and (random.random() < self.cfg.epsilon):
+        if (not eval_mode) and (random.random() < self.epsilon):
             return random.randrange(self.n_actions)
-
-        s = torch.as_tensor(s_np, dtype=torch.float32, device=self.device).unsqueeze(0)  # (1,state_dim)
-        phi = self.net.phi(s)
-        q, _ = self.net.q_all(phi)
+        s    = torch.as_tensor(s_np, dtype=torch.float32, device=self.device).unsqueeze(0)
+        q, _, _ = self.net.q_all(s)
         return int(q.argmax(dim=1).item())
 
-    def update_from_replay(self):
+    # ── learning step ─────────────────────────────────────────────────────────
+    def update_from_replay(self) -> Optional[Tuple[float, float]]:
         if len(self.rb) < max(self.cfg.batch_size, self.cfg.start_steps):
             return None
 
         batch = self.rb.sample(self.cfg.batch_size, device=self.device)
+        s    = batch["s"]
+        s2   = batch["s2"]
+        a    = batch["a"].long()
+        r    = batch["r"]
+        d    = batch["d"]
 
-        # =========================
-        # Step 1: SR update (θ_ψ)
-        # =========================
+        # ── Step 1: reward regression ─────────────────────────────────────────
+        # Trains encoder + w so that φ^T w ≈ reward
+        self.opt_rw.zero_grad()
+        phi  = self.net.phi(s)
+        loss_r = self.cfg.lambda_r * F.mse_loss(self.net.r_hat(phi), r)
+        loss_r.backward()
+        nn.utils.clip_grad_norm_(
+            list(self.net.encoder.parameters()) + [self.net.w],
+            self.cfg.grad_clip,
+        )
+        self.opt_rw.step()
+
+        # ── Step 2: SR Bellman ────────────────────────────────────────────────
+        # Trains encoder + SR head so that ψ(s,a) ≈ φ(s) + γ ψ(s',a*)
         self.opt_sr.zero_grad()
 
-        s = batch["s"]
-        s2 = batch["s2"]
-        a = batch["a"].long()
-        d = batch["d"]
+        _, psi_all, phi_s = self.net.q_all(s)
+        psi_sa = psi_all.gather(
+            1, a.view(-1, 1, 1).expand(-1, 1, psi_all.size(-1))
+        ).squeeze(1)                                            # (B, F)
 
         with torch.no_grad():
-            phi = self.net.phi(s)        # detach encoder
-            phi2 = self.net.phi(s2)
+            # Double-DQN: select action from online network (uses online w)
+            q2_online, _, _ = self.net.q_all(s2)
+            a_star = q2_online.argmax(1, keepdim=True)
 
-        psi = self.net.sr(phi)
-        psi_sa = psi.gather(1, a.view(-1,1,1).expand(-1,1,psi.size(-1))).squeeze(1)
+            # Bootstrap ψ from target SR + target encoder
+            _, psi2_all, _ = self.tgt.q_all(s2)
+            psi2 = psi2_all.gather(
+                1, a_star.view(-1, 1, 1).expand(-1, 1, psi2_all.size(-1))
+            ).squeeze(1)
 
-        with torch.no_grad():
-            q2, _ = self.net.q_all(phi2)
-            a_star = q2.argmax(1, keepdim=True)
-            psi2_all = self.tgt.sr(phi2)
-            psi2 = psi2_all.gather(1, a_star.view(-1,1,1).expand(-1,1,psi2_all.size(-1))).squeeze(1)
-            target_psi = phi + (1-d).unsqueeze(-1)*self.cfg.gamma*psi2
+            # BUG 2 FIX: detach φ(s) so SR loss cannot backprop through
+            # the encoder via the identity term.
+            # φ comes from target encoder for stability (frozen copy).
+            phi_s_target = self.tgt.phi(s).detach()
+            target_psi   = phi_s_target + (1.0 - d).unsqueeze(-1) * self.cfg.gamma * psi2
 
-        loss_sr = F.mse_loss(psi_sa, target_psi)
+        loss_sr = self.cfg.lambda_sr * F.mse_loss(psi_sa, target_psi)
         loss_sr.backward()
+        nn.utils.clip_grad_norm_(
+            list(self.net.encoder.parameters()) + list(self.net.sr.parameters()),
+            self.cfg.grad_clip,
+        )
         self.opt_sr.step()
 
-        # =========================
-        # Step 2: Representation update (θ_φ, θ_d, w)
-        # =========================
-        self.opt_repr.zero_grad()
+        # ── BUG 1 FIX: only copy encoder + SR to target, NOT w ───────────────
+        # w changes fast during reward learning — copying it to the target
+        # causes noisy a* selection and unstable SR TD targets.
+        if self.total_steps % self.cfg.target_update_freq == 0:
+            self.tgt.encoder.load_state_dict(self.net.encoder.state_dict())
+            self.tgt.sr.load_state_dict(self.net.sr.state_dict())
 
-        phi = self.net.phi(s)
-        r_hat = phi.matmul(self.net.w)
-        loss_r = F.mse_loss(r_hat, batch["r"])
+        return float(loss_sr.item()), float(loss_r.item())
 
-        s_hat = self.net.dec(phi)
-        loss_d = F.mse_loss(s_hat, s)
-
-        loss_repr = loss_r + loss_d
-        loss_repr.backward()
-        self.opt_repr.step()
-
-        soft_update(self.net, self.tgt, tau=self.cfg.tau)
-
-        return float(loss_sr.item() + loss_repr.item())
-
+    # ── store transition + learn ───────────────────────────────────────────────
     def observe_and_learn(
         self,
-        obs: dict,
-        action: int,
-        reward: float,
-        next_obs: dict,
+        obs:        Any,
+        action:     int,
+        reward:     float,
+        next_obs:   Any,
         terminated: bool,
-        truncated: bool,
-    ) -> float | None:
-        s = self.get_state_vec(obs)
-        s2 = self.get_state_vec(next_obs)
+        truncated:  bool,
+    ) -> Optional[Tuple[float, float]]:
+        s    = self.get_state_vec(obs)
+        s2   = self.get_state_vec(next_obs)
         done = bool(terminated or truncated)
 
         r = float(reward)
         if self.cfg.reward_clip is not None:
-            c = float(self.cfg.reward_clip)
-            r = float(np.clip(r, -c, c))
+            r = float(np.clip(r, -self.cfg.reward_clip, self.cfg.reward_clip))
 
         self.rb.push(s, action, r, s2, done)
         self.total_steps += 1
@@ -449,8 +356,13 @@ class DSRAgent:
             return self.update_from_replay()
         return None
 
-    def run_episode(self, env, eval_mode: bool = False, max_steps: int = 10_000):
-        obs, info = env.reset()
+    # ── full episode ───────────────────────────────────────────────────────────
+    def run_episode(
+        self,
+        env,
+        eval_mode: bool = False,
+    ) -> Tuple[int, float]:
+        obs, _info = env.reset()
         ep_ret = 0.0
         ep_len = 0
 
@@ -458,16 +370,16 @@ class DSRAgent:
             s = self.get_state_vec(obs)
             a = self.sample_action(s, eval_mode=eval_mode)
 
-            next_obs, reward, terminated, truncated, info = env.step(a)
+            next_obs, reward, terminated, truncated, _info = env.step(a)
 
             if not eval_mode:
                 self.observe_and_learn(obs, a, reward, next_obs, terminated, truncated)
 
             ep_ret += float(reward)
             ep_len += 1
-            obs = next_obs
+            obs     = next_obs
 
-            if terminated or truncated or ep_len >= max_steps:
+            if terminated or truncated:
                 break
 
         return ep_len, ep_ret

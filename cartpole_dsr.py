@@ -16,14 +16,13 @@ except ImportError:
 import argparse
 import types
 from collections import deque
-from typing import Optional
+from typing import Optional, Tuple
 
 import numpy as np
 import torch
 import gymnasium as gym
 
 from rl.DSR import DSRAgent, DSRConfig
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CLI
@@ -32,12 +31,11 @@ ap = argparse.ArgumentParser()
 ap.add_argument("-r", "--run_name",     required=False, default="cartpole-dsr")
 ap.add_argument("-p", "--project_name", required=False, default=None)
 ap.add_argument("-a", "--api_key",      required=False, default=None)
-ap.add_argument("--total_steps",        required=False, default=100_000, type=int)
+ap.add_argument("--total_steps",        required=False, default=300_000, type=int)
 ap.add_argument("--log_freq",           required=False, default=1_000,   type=int)
 ap.add_argument("--eval_freq",          required=False, default=5_000,   type=int)
 ap.add_argument("--eval_episodes",      required=False, default=10,      type=int)
 args = vars(ap.parse_args())
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # CometML
@@ -56,13 +54,11 @@ if args["api_key"] is not None:
 else:
     print("[info] no CometML key — logging to stdout")
 
-
 def log_metrics(metrics: dict, step: int):
     if experiment is not None:
         experiment.log_metrics(metrics, step=step)
     else:
         print(f"  step={step:>8}  " + "  ".join(f"{k}={v:.4f}" for k, v in metrics.items()))
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Environment
@@ -70,30 +66,29 @@ def log_metrics(metrics: dict, step: int):
 train_env = gym.make("CartPole-v1")
 eval_env  = gym.make("CartPole-v1")
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Agent
 # ──────────────────────────────────────────────────────────────────────────────
 config = DSRConfig(
-    state_dim            = 4,        # CartPole: [cart_pos, cart_vel, pole_angle, pole_vel]
-    feat_dim             = 32,
-    action_size          = 2,
-    map_size             = 1.0,      # CartPole values already small
-    sr_hidden            = 128,
-    learning_rate        = 1e-4,
-    gamma                = 0.99,
-    epsilon_start        = 1.0,
-    epsilon_end          = 0.05,
-    epsilon_decay_steps  = 10_000,   # 10% of 100k total steps
-    target_update_freq   = 500,
-    batch_size           = 32,
-    start_steps          = 1_000,
-    buffer_size          = 50_000,
-    train_freq           = 4,
-    lambda_sr            = 1.0,
-    lambda_r             = 1.0,
-    grad_clip            = 1.0,
-    device               = "cpu",
+    state_dim=4,           # CartPole: [cart_pos, cart_vel, pole_angle, pole_vel]
+    n_actions=2,
+    feat_dim=32,
+    gamma=0.99,
+    lambda_r=1.0,          # Reward regression weight
+    lambda_sr=1.0,         # SR Bellman weight
+    lambda_recon=0.1,      # Reconstruction weight
+    lr_rw=1e-3,            # Reward + reconstruction LR
+    lr_sr=1e-3,            # SR LR
+    grad_clip=0.5,
+    target_update_freq=1000,
+    train_freq=1,
+    batch_size=64,
+    replay_cap=100_000,
+    start_steps=1000,      # Add this parameter
+    epsilon_start=1.0,
+    epsilon_end=0.01,
+    epsilon_decay_steps=10_000,
+    reward_clip=1.0,
 )
 
 agent = DSRAgent(config)
@@ -103,25 +98,11 @@ if experiment is not None:
 
 # ── Patch get_state_vec for flat CartPole obs ─────────────────────────────────
 def cartpole_state_vec(self, obs):
-    if isinstance(obs, (tuple, list)) and not isinstance(obs[0], float):
+    if isinstance(obs, (tuple, list)) and len(obs) > 0 and not isinstance(obs[0], float):
         obs = obs[0]
     return np.asarray(obs, dtype=np.float32).flatten()
 
 agent.get_state_vec = types.MethodType(cartpole_state_vec, agent)
-
-if experiment is not None:
-    experiment.log_parameters(vars(config))
-
-# ── Patch get_state_vec for flat CartPole obs ─────────────────────────────────
-# CartPole returns a flat np.ndarray [cart_pos, cart_vel, pole_angle, pole_vel]
-# The default get_state_vec expects a dict — this patch handles the flat array.
-def cartpole_state_vec(self, obs):
-    if isinstance(obs, (tuple, list)) and not isinstance(obs[0], float):
-        obs = obs[0]
-    return np.asarray(obs, dtype=np.float32).flatten()
-
-agent.get_state_vec = types.MethodType(cartpole_state_vec, agent)
-
 
 # ──────────────────────────────────────────────────────────────────────────────
 # Evaluation
@@ -147,20 +128,20 @@ def evaluate(n_episodes: int = 10) -> dict:
         "eval/mean_length": float(np.mean(lengths)),
     }
 
-
 # ──────────────────────────────────────────────────────────────────────────────
 # Training loop
 # ──────────────────────────────────────────────────────────────────────────────
 print(f"\n[train] CartPole-v1  total_steps={args['total_steps']:,}")
 print(f"        Expect returns to climb from ~20 → ~400 if agent is learning\n")
 
-obs, _      = train_env.reset()
+obs, _ = train_env.reset()
 total_steps = 0
-ep_num      = 0
-ep_ret      = 0.0
-ep_len      = 0
+ep_num = 0
+ep_ret = 0.0
+ep_len = 0
 last_loss_sr: Optional[float] = None
-last_loss_r:  Optional[float] = None
+last_loss_r: Optional[float] = None
+last_loss_recon: Optional[float] = None
 
 ret_window = deque(maxlen=100)
 len_window = deque(maxlen=100)
@@ -168,19 +149,18 @@ len_window = deque(maxlen=100)
 best_eval_return: float = -np.inf
 
 while total_steps < args["total_steps"]:
-
     s = agent.get_state_vec(obs)
     a = agent.sample_action(s, eval_mode=False)
     next_obs, reward, terminated, truncated, _ = train_env.step(a)
 
     loss = agent.observe_and_learn(obs, a, reward, next_obs, terminated, truncated)
     if loss is not None:
-        last_loss_sr, last_loss_r = loss
+        last_loss_sr, last_loss_r, last_loss_recon = loss
 
-    ep_ret      += float(reward)
-    ep_len      += 1
+    ep_ret += float(reward)
+    ep_len += 1
     total_steps += 1
-    obs          = next_obs
+    obs = next_obs
 
     if terminated or truncated:
         ep_num += 1
@@ -201,11 +181,12 @@ while total_steps < args["total_steps"]:
             "rollout/ep_rew_mean": float(np.mean(ret_window)),
             "rollout/ep_len_mean": float(np.mean(len_window)),
             "rollout/buffer_size": len(agent.rb),
-            "rollout/epsilon":     agent.epsilon,
+            "rollout/epsilon": agent.epsilon,
         }
         if last_loss_sr is not None:
             metrics["train/loss_sr"] = last_loss_sr
-            metrics["train/loss_r"]  = last_loss_r
+            metrics["train/loss_r"] = last_loss_r
+            metrics["train/loss_recon"] = last_loss_recon
         log_metrics(metrics, step=total_steps)
 
     if total_steps % args["eval_freq"] == 0:
